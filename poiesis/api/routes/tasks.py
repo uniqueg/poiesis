@@ -10,7 +10,8 @@ import asyncpg
 from fastapi import APIRouter, Depends, Query
 from kubernetes.client.exceptions import ApiException
 
-from poiesis.api.auth import Principal, get_principal
+from poiesis.api.auth import Principal
+from poiesis.api.authz import Authz, authorized_principal, get_authz
 from poiesis.api.deps import get_db_conn, get_k8s, get_runtime_config
 from poiesis.api.exceptions import (
     APIError,
@@ -52,14 +53,26 @@ router = APIRouter(tags=["TaskService"])
 )
 async def create_task(
     task: TesTask,
-    conn: Annotated[Any, Depends(get_db_conn)],
     k8s: Annotated[K8sClient, Depends(get_k8s)],
     runtime_config: Annotated[RuntimeConfig, Depends(get_runtime_config)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    principal: Annotated[Principal, Depends(authorized_principal)],
+    authz: Annotated[Authz, Depends(get_authz)],
+    conn: Annotated[Any, Depends(get_db_conn)],
 ) -> TesCreateTaskResponse:
     """Accept a TES task, persist it, and submit its TaskPod to Kubernetes."""
-    task.id = task.id or str(uuid.uuid4())
-    task.state = TesState.QUEUED
+    # Server-assigned fields: a client-chosen id would reveal whether a
+    # task with that id exists.
+    task = task.model_copy(
+        update={
+            "id": str(uuid.uuid4()),
+            "state": TesState.QUEUED,
+            "logs": None,
+            "creation_time": TesTask.model_fields["creation_time"].get_default(
+                call_default_factory=True
+            ),
+        }
+    )
+    await authz.check_create(principal, task)
 
     # Build the K8s manifests first so spec-builder errors (e.g.
     # ignore_error=True) surface as 400s before we write anything.
@@ -206,10 +219,11 @@ def _classify_submit_exception(
 )
 async def cancel_task(
     id: str,
-    conn: Annotated[Any, Depends(get_db_conn)],
     k8s: Annotated[K8sClient, Depends(get_k8s)],
     runtime_config: Annotated[RuntimeConfig, Depends(get_runtime_config)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    principal: Annotated[Principal, Depends(authorized_principal)],
+    authz: Annotated[Authz, Depends(get_authz)],
+    conn: Annotated[Any, Depends(get_db_conn)],
 ) -> TesCancelTaskResponse:
     """Mark the task CANCELING and delete its wrapping Kubernetes Job.
 
@@ -222,13 +236,8 @@ async def cancel_task(
     except ValueError as exc:
         raise BadRequestError(f"invalid task id: {id}") from exc
 
-    if (
-        await tasks_db.get_task(
-            conn, task_uuid, view=TaskView.MINIMAL, principal=principal.id
-        )
-        is None
-    ):
-        raise NotFoundError(f"task {id} not found")
+    meta = await tasks_db.get_task_meta(conn, task_uuid)
+    await authz.check_cancel(principal, task_uuid, meta)
 
     transitioned = await state_db.mark_canceling(conn, task_uuid)
     if not transitioned:
@@ -252,8 +261,9 @@ async def cancel_task(
 )
 async def get_task(
     id: str,
+    principal: Annotated[Principal, Depends(authorized_principal)],
+    authz: Annotated[Authz, Depends(get_authz)],
     conn: Annotated[Any, Depends(get_db_conn)],
-    principal: Annotated[Principal, Depends(get_principal)],
     view: Annotated[TaskView, Query()] = TaskView.MINIMAL,
 ) -> TesTask:
     """Return a single task at the requested view level."""
@@ -262,7 +272,9 @@ async def get_task(
     except ValueError as exc:
         raise BadRequestError(f"invalid task id: {id}") from exc
 
-    task = await tasks_db.get_task(conn, task_uuid, view=view, principal=principal.id)
+    meta = await tasks_db.get_task_meta(conn, task_uuid)
+    allowed = await authz.may_read(principal, task_uuid, meta, view.value)
+    task = await tasks_db.get_task(conn, task_uuid, view=view) if allowed else None
     if task is None:
         raise NotFoundError(f"task {id} not found")
     return task
@@ -293,13 +305,15 @@ def _list_filters(
     operation_id="ListTasks",
 )
 async def list_tasks(
-    conn: Annotated[Any, Depends(get_db_conn)],
     filters: Annotated[ListFilters, Depends(_list_filters)],
-    principal: Annotated[Principal, Depends(get_principal)],
+    principal: Annotated[Principal, Depends(authorized_principal)],
+    authz: Annotated[Authz, Depends(get_authz)],
+    conn: Annotated[Any, Depends(get_db_conn)],
     view: Annotated[TaskView, Query()] = TaskView.MINIMAL,
 ) -> TesListTasksResponse:
     """Return a paginated list of tasks, newest first."""
-    filters.principal = principal.id
+    all_tasks = await authz.lists_all(principal, view.value)
+    filters.principal = None if all_tasks else principal.id
     try:
         tasks, next_token = await tasks_db.list_tasks(conn, filters, view=view)
     except ValueError as exc:
