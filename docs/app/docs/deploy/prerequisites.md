@@ -11,6 +11,10 @@ are a 1.29 feature that the TaskPod requires.
 - **Production:** Managed K8s (GKE, EKS, AKS) at 1.29+. Default
   `StorageClass` with `ReadWriteOnce` PVC support. Egress to your
   S3/HTTP storage.
+- **OpenShift:** works without extra RBAC. Poiesis needs no
+  `jobs/finalizers` permission (which project admins often can't
+  grant), because the task PVC's ownerReference to its Job sets
+  `blockOwnerDeletion: false`.
 
 ## PostgreSQL
 

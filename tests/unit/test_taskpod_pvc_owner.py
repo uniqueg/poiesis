@@ -1,11 +1,4 @@
-"""The task PVC's ownerReference must not block the Job's deletion.
-
-``blockOwnerDeletion: true`` on an ownerReference needs ``update`` on the
-owner's ``finalizers`` subresource (here ``jobs/finalizers``) when the API
-server's OwnerReferencesPermissionEnforcement admission plugin is on, as on
-OpenShift. Namespace admins often can't grant that, so creating the PVC
-failed there. Garbage collection of the PVC works without it.
-"""
+"""The task PVC's ownerReference must not block the Job's deletion."""
 
 from __future__ import annotations
 
